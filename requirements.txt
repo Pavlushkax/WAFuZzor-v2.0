@@ -1,0 +1,11 @@
+# Fuzzer için (zorunlu)
+aiohttp>=3.9.0
+rich>=13.0.0
+
+# Lab ortamı için (zorunlu)
+flask>=3.0.0
+markupsafe>=2.1.0
+
+# JS Challenge bypass için (opsiyonel)
+# pip install playwright && playwright install chromium
+# playwright>=1.40.0
