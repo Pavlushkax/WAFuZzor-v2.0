@@ -655,6 +655,8 @@ class BypassDetector:
         lower_body = body.lower()
 
         # Signal 1: Status farklı mı blocked'tan?
+        if status == 429:
+            return None
         if status != self.blocked.status and status not in [0, -1]:
             bypass_signals += 1
             reasons.append(f"Status değişti: {self.blocked.status} → {status}")
@@ -967,7 +969,9 @@ class WAFFuzzer:
                 else:
                     await asyncio.gather(*[_worker(pl) for pl in mutations])
 
-    def _record(self, payload: str, status: int, length: int, analysis: dict):
+    def _record(self, payload, status, length, analysis):
+        if analysis is None:
+            return  # 429 rate limit — atla
         r = FuzzResult(
             payload=payload,
             status=status,
@@ -1168,6 +1172,9 @@ async def main():
                 line = line.strip()
                 if line and not line.startswith("#"):
                     base_payloads.append(line)
+                    if args.wordlist and not args.no_mutate:
+                        args.no_mutate = True
+                        print("[!] Wordlist modu: mutation otomatik kapatıldı.")
 
     if not base_payloads:
         console.print("[danger]Hiç payload yüklenmedi![/danger]")
