@@ -545,13 +545,90 @@ class MutationEngine:
 # ---------------------------------------------------------------------------
 class WAFFingerprinter:
     """
-    Baseline isteğinin response header/body/status'ına bakarak WAF tespiti yapar.
-    Birden fazla WAF eşleşebilir; güven skoru ile sıralar.
+    İki aşamalı WAF tespiti:
+    1. Pasif: Header / body / status imza eşleşmesi
+    2. Davranışsal: Blok davranışı pattern'lerini analiz et
+       - Hangi payloadları blokluyor, hangilerini geçiriyor?
+       - Block mesajının yapısı (JSON mu, HTML mi, custom mu?)
+       - Rate limiting davranışı var mı?
+       - Response süresi tutarlı mı? (learning mode tespiti)
     """
+
+    # Davranışsal imzalar — her WAF'ın blok mesajı farklı yapıda
+    BEHAVIORAL_SIGNATURES = {
+        "Cloudflare": {
+            "block_body_patterns": [
+                r"cloudflare",
+                r"__cf_chl",
+                r"cf-browser-verification",
+                r"<title>.*?attention required.*?</title>",
+                r"ray\s+id:\s*[a-f0-9]+",
+            ],
+            "block_content_type": None,   # HTML veya JSON olabilir
+            "js_challenge": True,
+        },
+        "AWS WAF": {
+            "block_body_patterns": [
+                r"aws\s+waf",
+                r'"message"\s*:\s*"forbidden"',
+                r"request\s+blocked",
+            ],
+            "block_content_type": "application/json",
+            "js_challenge": False,
+        },
+        "Imperva (Incapsula)": {
+            "block_body_patterns": [
+                r"incapsula\s+incident",
+                r"_incapsula_resource",
+                r"incap_ses",
+                r"visid_incap",
+            ],
+            "block_content_type": None,
+            "js_challenge": True,
+        },
+        "ModSecurity": {
+            "block_body_patterns": [
+                r"mod_security",
+                r"modsecurity",
+                r"this\s+error\s+was\s+generated\s+by\s+mod_security",
+                r"406\s+not\s+acceptable",
+            ],
+            "block_content_type": "text/html",
+            "js_challenge": False,
+        },
+        "Akamai": {
+            "block_body_patterns": [
+                r"reference\s+#",
+                r"access\s+denied.*?akamai",
+                r"akamai-grn",
+            ],
+            "block_content_type": "text/html",
+            "js_challenge": False,
+        },
+        "F5 BIG-IP ASM": {
+            "block_body_patterns": [
+                r"the\s+requested\s+url\s+was\s+rejected",
+                r"f5\s+big-?ip",
+                r"support\s+id:",
+            ],
+            "block_content_type": "text/html",
+            "js_challenge": False,
+        },
+        "Sucuri": {
+            "block_body_patterns": [
+                r"sucuri\s+website\s+firewall",
+                r"access\s+denied\s*-\s*sucuri",
+                r"generated\s+by\s+sucuri",
+            ],
+            "block_content_type": "text/html",
+            "js_challenge": False,
+        },
+    }
 
     @staticmethod
     def fingerprint(status: int, headers: dict, body: str) -> list[tuple[str, int]]:
         """
+        Pasif fingerprint: header/body/status imza eşleşmesi.
         Returns: [(waf_name, confidence_pct), ...]  en yüksekten en düşüğe
         """
         scores: dict[str, int] = {}
@@ -578,11 +655,15 @@ class WAFFingerprinter:
             if score > 0:
                 scores[waf_name] = score
 
+        # Davranışsal analiz ile ek puan
+        behavioral_scores = WAFFingerprinter._behavioral_score(status, headers, body)
+        for waf_name, extra in behavioral_scores.items():
+            scores[waf_name] = scores.get(waf_name, 0) + extra
+
         if not scores:
             return []
 
         max_score = max(scores.values())
-        # Normalize → yüzde (max olası skor = header*3 + body*2 + status*1)
         result = []
         for name, s in sorted(scores.items(), key=lambda x: x[1], reverse=True):
             pct = min(int((s / max(max_score, 1)) * 100), 99)
@@ -591,17 +672,158 @@ class WAFFingerprinter:
         return result
 
     @staticmethod
-    def display(results: list[tuple[str, int]]):
+    def _behavioral_score(status: int, headers: dict, body: str) -> dict[str, int]:
+        """
+        Block response'un yapısını analiz ederek davranışsal puanlar üret.
+        """
+        scores: dict[str, int] = {}
+        lower_body = body.lower()
+        content_type = headers.get("Content-Type", headers.get("content-type", "")).lower()
+
+        for waf_name, bsig in WAFFingerprinter.BEHAVIORAL_SIGNATURES.items():
+            score = 0
+
+            # Body pattern regex eşleşmesi (ağırlık: 4 — çok spesifik)
+            for pattern in bsig["block_body_patterns"]:
+                if re.search(pattern, lower_body, re.I | re.S):
+                    score += 4
+
+            # Content-Type eşleşmesi (ağırlık: 2)
+            if bsig["block_content_type"] and bsig["block_content_type"] in content_type:
+                score += 2
+
+            if score > 0:
+                scores[waf_name] = score
+
+        return scores
+
+    @classmethod
+    async def behavioral_probe(cls, session: aiohttp.ClientSession,
+                                base_url: str, headers: dict, cookies: dict,
+                                proxy: str | None, timeout: int) -> dict:
+        """
+        Aktif davranışsal analiz — 3 farklı payload göndererek WAF davranışını ölç.
+        
+        Returns: {
+            "block_rate": float,          # kaç payload bloklandı (0.0-1.0)
+            "avg_block_time_ms": float,   # ortalama blok süresi
+            "avg_pass_time_ms": float,    # ortalama geçiş süresi
+            "consistent_timing": bool,    # timing tutarlı mı (learning mode değil)
+            "learning_mode_suspected": bool,
+            "rate_limit_detected": bool,
+            "notes": list[str],
+        }
+        """
+        PROBE_PAYLOADS = [
+            ("benign",    "safe_test_string_123"),
+            ("sqli",      "' OR '1'='1'--"),
+            ("xss",       "<script>alert(1)</script>"),
+            ("cmdi",      "; id"),
+            ("path",      "../../etc/passwd"),
+            ("sqli2",     "1 UNION SELECT 1,2,3--"),
+        ]
+
+        results = []
+        rate_limited = False
+
+        for label, payload in PROBE_PAYLOADS:
+            safe_p = payload.replace(" ", "%20")
+            sep = "&" if "?" in base_url else "?"
+            target = base_url.replace("FUZZ", safe_p) if "FUZZ" in base_url else f"{base_url}{sep}q={safe_p}"
+
+            t0 = time.monotonic()
+            try:
+                async with session.get(
+                    target, headers=headers, cookies=cookies,
+                    proxy=proxy, ssl=False if proxy else None,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    allow_redirects=False,
+                ) as resp:
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    body = await resp.text(errors="replace")
+                    results.append({
+                        "label":      label,
+                        "status":     resp.status,
+                        "elapsed_ms": elapsed_ms,
+                        "blocked":    resp.status in [403, 406, 429, 503],
+                    })
+                    if resp.status == 429:
+                        rate_limited = True
+            except Exception:
+                results.append({"label": label, "status": -1, "elapsed_ms": 0, "blocked": False})
+
+        # Analiz
+        blocked = [r for r in results if r["blocked"]]
+        passed  = [r for r in results if not r["blocked"] and r["status"] > 0]
+        block_rate = len(blocked) / len(results) if results else 0
+
+        avg_block_time = sum(r["elapsed_ms"] for r in blocked) / max(len(blocked), 1)
+        avg_pass_time  = sum(r["elapsed_ms"] for r in passed) / max(len(passed), 1)
+
+        # Timing tutarlılığı — standart sapma düşükse tutarlı
+        if blocked:
+            times = [r["elapsed_ms"] for r in blocked]
+            mean = sum(times) / len(times)
+            variance = sum((t - mean) ** 2 for t in times) / len(times)
+            std_dev = variance ** 0.5
+            consistent_timing = std_dev < 50  # 50ms tolerans
+        else:
+            consistent_timing = True
+
+        # Learning mode şüphesi: benign ve malicious aynı süre alıyorsa WAF inceliyor olabilir
+        learning_suspected = False
+        if avg_block_time > 0 and avg_pass_time > 0:
+            time_ratio = avg_block_time / avg_pass_time
+            if 0.8 < time_ratio < 1.2 and block_rate < 0.5:
+                learning_suspected = True
+
+        notes = []
+        if rate_limited:
+            notes.append("Rate limiting aktif (HTTP 429 alındı)")
+        if learning_suspected:
+            notes.append(f"WAF learning mode şüpheli (blok/geçiş süre oranı: {time_ratio:.2f})")
+        if block_rate == 0 and len(PROBE_PAYLOADS) > 2:
+            notes.append("WAF yok veya hiçbir probe bloklunmadı")
+        if block_rate > 0.8:
+            notes.append(f"Çok agresif WAF — probe'ların %{block_rate*100:.0f}'i bloklandı")
+
+        return {
+            "block_rate":               block_rate,
+            "avg_block_time_ms":        round(avg_block_time, 1),
+            "avg_pass_time_ms":         round(avg_pass_time, 1),
+            "consistent_timing":        consistent_timing,
+            "learning_mode_suspected":  learning_suspected,
+            "rate_limit_detected":      rate_limited,
+            "notes":                    notes,
+        }
+
+    @staticmethod
+    def display(results: list[tuple[str, int]], behavioral: dict | None = None):
         if not results:
             console.print("[muted]WAF tespiti yapılamadı veya WAF yok.[/muted]")
-            return
+        else:
+            console.print("\n[primary]── WAF Fingerprint ──────────────────────────────[/primary]")
+            for name, conf in results:
+                bar = "█" * (conf // 10) + "░" * (10 - conf // 10)
+                color = "success" if conf >= 70 else "warning" if conf >= 40 else "muted"
+                console.print(f"  [{color}]{name:25s}[/{color}] {bar} {conf}%")
+            console.print()
 
-        console.print("\n[primary]── WAF Fingerprint ──────────────────────────────[/primary]")
-        for name, conf in results:
-            bar = "█" * (conf // 10) + "░" * (10 - conf // 10)
-            color = "success" if conf >= 70 else "warning" if conf >= 40 else "muted"
-            console.print(f"  [{color}]{name:25s}[/{color}] {bar} {conf}%")
-        console.print()
+        # Davranışsal analiz sonuçları
+        if behavioral:
+            console.print("[primary]── Davranışsal Analiz ────────────────────────────[/primary]")
+            br = behavioral["block_rate"]
+            br_color = "danger" if br > 0.7 else "warning" if br > 0.3 else "success"
+            console.print(f"  Blok oranı       [{br_color}]{br*100:.0f}%[/{br_color}]")
+            console.print(f"  Blok süresi      {behavioral['avg_block_time_ms']:.0f}ms  |  Geçiş süresi: {behavioral['avg_pass_time_ms']:.0f}ms")
+
+            if behavioral["rate_limit_detected"]:
+                console.print("  [warning]⚠ Rate limiting tespit edildi[/warning]")
+            if behavioral["learning_mode_suspected"]:
+                console.print("  [warning]⚠ WAF learning mode şüpheli — sonuçlar değişken olabilir[/warning]")
+            for note in behavioral["notes"]:
+                console.print(f"  [muted]• {note}[/muted]")
+            console.print()
 
 
 # ---------------------------------------------------------------------------
@@ -622,8 +844,8 @@ class BypassDetector:
     
     Yöntemler:
     1. Status code farkı
-    2. Body hash farkı (içerik değişti mi?)
-    3. Response length delta (>%20 fark)
+    2. Body hash farkı — dinamik içerik normalize edilerek (CSRF token, timestamp, nonce)
+    3. Response length delta (>%20 fark) — dinamik uzunluk toleransı ile
     4. Benign body keyword eşleşmesi
     5. Blocked keyword yokluğu
     """
@@ -635,43 +857,102 @@ class BypassDetector:
         "request id", "reference #", "incident", "violation",
     ]
 
+    # Dinamik içerik pattern'leri — bu değerler her istekte değişir, hash karşılaştırmasını bozar
+    # Normalize ederek sabit placeholder ile değiştiriyoruz
+    DYNAMIC_PATTERNS = [
+        # CSRF token'lar
+        (re.compile(r'<input[^>]+name=["\']?_?csrf[_-]?token["\']?[^>]+value=["\']([^"\']+)["\']', re.I), 'CSRF_TOKEN'),
+        (re.compile(r'<input[^>]+value=["\']([^"\']{20,})["\'][^>]+name=["\']?_?csrf', re.I), 'CSRF_TOKEN'),
+        (re.compile(r'"csrf[_-]?token"\s*:\s*"([^"]+)"', re.I), 'CSRF_TOKEN'),
+        (re.compile(r'name="__RequestVerificationToken"[^>]+value="([^"]+)"', re.I), 'CSRF_TOKEN'),
+        # Timestamp / nonce değerleri
+        (re.compile(r'"nonce"\s*:\s*"([a-f0-9]{8,})"', re.I), 'NONCE'),
+        (re.compile(r'nonce="([a-f0-9]{8,})"', re.I), 'NONCE'),
+        (re.compile(r'"timestamp"\s*:\s*\d{10,13}', re.I), '"timestamp":TS'),
+        (re.compile(r'<meta[^>]+name=["\']?timestamp["\']?[^>]+content=["\'](\d+)["\']', re.I), 'TS'),
+        # Session ID'ler (hidden input)
+        (re.compile(r'<input[^>]+type=["\']hidden["\'][^>]+value=["\']([a-f0-9]{32,})["\']', re.I), 'SESSION'),
+        # UUID / random token formatlar
+        (re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I), 'UUID'),
+        # Unix timestamp (10 hane sayı — URL veya JSON içinde)
+        (re.compile(r'\b1[0-9]{9}\b'), 'UNIXTS'),
+        # Cloudflare ray ID
+        (re.compile(r'Ray ID:\s*[a-f0-9]+', re.I), 'CF_RAY'),
+        # ViewState (ASP.NET)
+        (re.compile(r'<input[^>]+id=["\']?__VIEWSTATE["\']?[^>]+value=["\']([^"\']{20,})["\']', re.I), 'VIEWSTATE'),
+    ]
+
     def __init__(self, benign_profile: BaselineProfile, blocked_profile: BaselineProfile):
         self.benign = benign_profile
         self.blocked = blocked_profile
+        # Normalize edilmiş baseline hash'lerini hesapla (bir kez)
+        self._blocked_norm_hash = self._norm_hash(blocked_profile.body_sample)
+        self._benign_norm_body  = self._normalize(benign_profile.body_sample)
 
-    def analyze(self, payload: str, status: int, length: int, body: str) -> dict:
+    @classmethod
+    def _normalize(cls, body: str) -> str:
+        """
+        Dinamik içerikleri sabit placeholder ile değiştirerek body'yi normalize eder.
+        Böylece CSRF token / timestamp farklılıkları false positive üretmez.
+        """
+        normalized = body
+        for pattern, placeholder in cls.DYNAMIC_PATTERNS:
+            normalized = pattern.sub(placeholder, normalized)
+        return normalized
+
+    @classmethod
+    def _norm_hash(cls, body: str) -> str:
+        return hashlib.sha256(cls._normalize(body).encode(errors="replace")).hexdigest()
+
+    def _dynamic_length_tolerance(self, body: str) -> int:
+        """
+        Body içindeki dinamik alan sayısına göre uzunluk toleransını hesaplar.
+        Her dinamik alan ortalama 40 byte etki yaratabilir.
+        """
+        count = 0
+        for pattern, _ in self.DYNAMIC_PATTERNS:
+            count += len(pattern.findall(body))
+        return count * 40  # byte cinsinden ek tolerans
+
+    def analyze(self, payload: str, status: int, length: int, body: str) -> dict | None:
         """
         Returns: {
             "bypass": bool,
             "confidence": int (0-100),
             "reasons": list[str]
         }
+        Returns None for rate-limited (429) responses — not a bypass.
         """
+        # 429: Rate limit — bypass değil, atla
+        if status == 429:
+            return None
+
         reasons = []
         bypass_signals = 0
         total_signals = 5
 
-        body_hash = hashlib.sha256(body.encode(errors="replace")).hexdigest()
+        # Normalize edilmiş hash — dinamik içerik farklılıklarını filtrele
+        norm_hash = self._norm_hash(body)
         lower_body = body.lower()
 
         # Signal 1: Status farklı mı blocked'tan?
-        if status == 429:
-            return None
         if status != self.blocked.status and status not in [0, -1]:
             bypass_signals += 1
             reasons.append(f"Status değişti: {self.blocked.status} → {status}")
 
-        # Signal 2: Body hash farklı mı blocked'tan?
-        if body_hash != self.blocked.body_hash and body_hash != "":
+        # Signal 2: Body hash farklı mı blocked'tan? (normalize edilmiş karşılaştırma)
+        if norm_hash != self._blocked_norm_hash and norm_hash != "":
             bypass_signals += 1
-            reasons.append("Response body içeriği değişti")
+            reasons.append("Response body içeriği değişti (normalize edilmiş)")
 
-        # Signal 3: Length delta > %20
+        # Signal 3: Length delta > %20 — dinamik içerik toleransı ile
         if self.blocked.length > 0:
-            delta_pct = abs(length - self.blocked.length) / self.blocked.length
+            tolerance = self._dynamic_length_tolerance(body)
+            effective_len_diff = abs(length - self.blocked.length) - tolerance
+            delta_pct = effective_len_diff / self.blocked.length if effective_len_diff > 0 else 0
             if delta_pct > 0.20:
                 bypass_signals += 1
-                reasons.append(f"Response length delta: %{delta_pct*100:.0f}")
+                reasons.append(f"Response length delta: %{delta_pct*100:.0f} (tolerans: {tolerance}B)")
 
         # Signal 4: Block keyword yok mu?
         block_kw_in_resp = any(kw in lower_body for kw in self.BLOCK_KEYWORDS)
@@ -680,9 +961,10 @@ class BypassDetector:
             bypass_signals += 1
             reasons.append("Bloklama keyword'ü response'ta yok")
 
-        # Signal 5: Benign body'ye benzeme (difflib similarity)
-        if self.benign.body_sample and body:
-            similarity = difflib.SequenceMatcher(None, self.benign.body_sample[:200], body[:200]).ratio()
+        # Signal 5: Benign body'ye benzeme (normalize edilmiş difflib similarity)
+        norm_body = self._normalize(body)
+        if self._benign_norm_body and norm_body:
+            similarity = difflib.SequenceMatcher(None, self._benign_norm_body[:300], norm_body[:300]).ratio()
             if similarity > 0.65:
                 bypass_signals += 1
                 reasons.append(f"Benign response'a benziyor (similarity: {similarity:.2f})")
@@ -805,6 +1087,7 @@ class WAFFuzzer:
         self.benign_profile:  Optional[BaselineProfile] = None
         self.blocked_profile: Optional[BaselineProfile] = None
         self.waf_names:       list[tuple[str, int]] = []
+        self.behavioral_info: dict = {}
 
         # Injection noktası
         if "FUZZ" not in self.url and self.method == "GET" and not self.data:
@@ -820,10 +1103,14 @@ class WAFFuzzer:
         return target, body
 
     async def _fetch_raw(self, session: aiohttp.ClientSession,
-                         payload: str) -> tuple[str, int, int, str, dict]:
+                         payload: str, _retry: int = 0) -> tuple[str, int, int, str, dict]:
         """
         Returns: (payload, status, len, body_text, response_headers)
+        Retry: timeout veya 5xx hatasında max 3 kez tekrar dener, exponential backoff ile.
         """
+        MAX_RETRIES = 3
+        RETRY_ON_STATUS = {500, 502, 503, 504}  # geçici sunucu hataları
+
         target, body = self._inject(payload)
 
         req_headers = self.headers.copy()
@@ -854,10 +1141,28 @@ class WAFFuzzer:
                     body_text = raw.decode("utf-8", errors="replace")
                 except Exception:
                     body_text = ""
+
+                # 5xx hatasında retry
+                if resp.status in RETRY_ON_STATUS and _retry < MAX_RETRIES:
+                    backoff = 0.5 * (2 ** _retry)  # 0.5s, 1s, 2s
+                    await asyncio.sleep(backoff)
+                    return await self._fetch_raw(session, payload, _retry + 1)
+
                 return payload, resp.status, len(raw), body_text, dict(resp.headers)
 
         except asyncio.TimeoutError:
+            if _retry < MAX_RETRIES:
+                backoff = 0.5 * (2 ** _retry)
+                await asyncio.sleep(backoff)
+                return await self._fetch_raw(session, payload, _retry + 1)
             return payload, 0, 0, "", {}
+
+        except aiohttp.ServerDisconnectedError:
+            if _retry < MAX_RETRIES:
+                await asyncio.sleep(1.0)
+                return await self._fetch_raw(session, payload, _retry + 1)
+            return payload, -1, 0, "", {}
+
         except Exception:
             return payload, -1, 0, "", {}
 
@@ -884,7 +1189,7 @@ class WAFFuzzer:
     # -----------------------------------------------------------------------
     # Baseline Check
     # -----------------------------------------------------------------------
-    async def run_baseline(self, benign_str: str, malicious_payload: str) -> bool:
+    async def run_baseline(self, benign_str: str, malicious_payload: str, behavioral: bool = True) -> bool:
         console.print("\n[primary]── Baseline Check ───────────────────────────────[/primary]")
         await self._handle_js_challenge()
 
@@ -931,7 +1236,24 @@ class WAFFuzzer:
             )
             console.print(f"[success]✔[/success] Malicious → HTTP {m_status} | {m_len} bytes (bloklandı)")
 
-        WAFFingerprinter.display(self.waf_names)
+
+
+        if not behavioral:
+            WAFFingerprinter.display(self.waf_names)
+            return True
+        # Davranışsal analiz — ek 6 probe göndererek WAF davranışını ölç
+        console.print("[muted]Davranışsal analiz yapılıyor...[/muted]")
+        async with await self._make_session() as probe_session:
+            self.behavioral_info = await WAFFingerprinter.behavioral_probe(
+                session=probe_session,
+                base_url=self.target_url,
+                headers=self.headers,
+                cookies=self.cookies,
+                proxy=self.proxy,
+                timeout=self.timeout,
+            )
+        WAFFingerprinter.display([], behavioral=self.behavioral_info)
+
         return True
 
     # -----------------------------------------------------------------------
@@ -969,7 +1291,7 @@ class WAFFuzzer:
                 else:
                     await asyncio.gather(*[_worker(pl) for pl in mutations])
 
-    def _record(self, payload, status, length, analysis):
+    def _record(self, payload: str, status: int, length: int, analysis: dict):
         if analysis is None:
             return  # 429 rate limit — atla
         r = FuzzResult(
@@ -1062,6 +1384,312 @@ class WAFFuzzer:
                 f.write(r.payload + "\n")
         console.print(f"[success]✔[/success] Payload listesi → {path}")
 
+    def export_html(self, path: str):
+        """Bypass sonuçlarını güzel bir HTML rapora yazar."""
+        import html as html_mod
+        from datetime import datetime
+
+        bypasses = [r for r in self.results if r.bypass]
+        total    = len(self.results)
+        waf_str  = ", ".join(n for n, _ in self.waf_names) if self.waf_names else "Tespit edilemedi"
+        target   = self.url
+        now      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Davranışsal bilgiler
+        beh = self.behavioral_info
+        beh_block_rate  = f"{beh.get('block_rate', 0)*100:.0f}%"
+        beh_block_ms    = f"{beh.get('avg_block_time_ms', 0):.0f}ms"
+        beh_pass_ms     = f"{beh.get('avg_pass_time_ms', 0):.0f}ms"
+        beh_ratelimit   = "✅ Evet" if beh.get("rate_limit_detected") else "❌ Hayır"
+        beh_learning    = "⚠️ Şüpheli" if beh.get("learning_mode_suspected") else "✅ Normal"
+        beh_notes_html  = "".join(f"<li>{html_mod.escape(n)}</li>" for n in beh.get("notes", []))
+
+        # Bypass satırları
+        rows_html = ""
+        for r in bypasses:
+            conf_color = "#22c55e" if r.confidence >= 80 else "#f59e0b" if r.confidence >= 60 else "#ef4444"
+            payload_esc = html_mod.escape(r.payload)
+            reasons_esc = html_mod.escape(", ".join(r.reasons))
+            rows_html += f"""
+            <tr>
+                <td><span class="badge" style="background:#1e40af">{r.status}</span></td>
+                <td>{r.length}</td>
+                <td><span class="badge" style="background:{conf_color}">{r.confidence}%</span></td>
+                <td>{r.signals}</td>
+                <td class="payload-cell" title="{payload_esc}">{payload_esc[:100]}{'...' if len(r.payload) > 100 else ''}</td>
+                <td>{reasons_esc}</td>
+            </tr>"""
+
+        html_content = f"""<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WAFuZzor — Rapor</title>
+<style>
+  :root {{
+    --bg: #0f172a; --card: #1e293b; --border: #334155;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
+    --green: #22c55e; --red: #ef4444; --yellow: #f59e0b;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; padding: 2rem; }}
+  h1 {{ color: var(--accent); font-size: 1.8rem; margin-bottom: 0.25rem; }}
+  .subtitle {{ color: var(--muted); font-size: 0.9rem; margin-bottom: 2rem; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 2rem; }}
+  .stat-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; }}
+  .stat-card .label {{ color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+  .stat-card .value {{ font-size: 1.8rem; font-weight: 700; margin-top: 0.25rem; }}
+  .stat-card .value.green {{ color: var(--green); }}
+  .stat-card .value.red {{ color: var(--red); }}
+  .stat-card .value.yellow {{ color: var(--yellow); }}
+  .section {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }}
+  .section h2 {{ color: var(--accent); font-size: 1rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+  th {{ background: #0f172a; color: var(--muted); text-align: left; padding: 0.6rem 0.75rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+  td {{ padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: top; }}
+  tr:last-child td {{ border-bottom: none; }}
+  tr:hover td {{ background: rgba(56,189,248,0.04); }}
+  .badge {{ display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; color: #fff; }}
+  .payload-cell {{ font-family: 'Consolas', monospace; font-size: 0.8rem; color: #fbbf24; word-break: break-all; max-width: 400px; }}
+  .beh-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem; }}
+  .beh-item {{ background: #0f172a; border-radius: 8px; padding: 0.75rem; }}
+  .beh-item .k {{ color: var(--muted); font-size: 0.75rem; margin-bottom: 0.25rem; }}
+  .beh-item .v {{ font-weight: 600; font-size: 0.95rem; }}
+  .notes-list {{ margin-top: 0.75rem; padding-left: 1.25rem; color: var(--yellow); font-size: 0.85rem; }}
+  .no-bypass {{ text-align: center; color: var(--muted); padding: 2rem; }}
+  .footer {{ text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 2rem; }}
+</style>
+</head>
+<body>
+
+<h1>🛡️ WAFuZzor — Pentest Raporu</h1>
+<p class="subtitle">Oluşturulma: {now} &nbsp;|&nbsp; Hedef: <code>{html_mod.escape(target)}</code> &nbsp;|&nbsp; WAF: {html_mod.escape(waf_str)}</p>
+
+<div class="grid">
+  <div class="stat-card">
+    <div class="label">Toplam Mutation</div>
+    <div class="value">{total}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Bypass Tespit</div>
+    <div class="value {'red' if len(bypasses) > 0 else 'green'}">{len(bypasses)}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Bypass Oranı</div>
+    <div class="value {'red' if len(bypasses) > 0 else 'green'}">{len(bypasses)/max(total,1)*100:.1f}%</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">WAF</div>
+    <div class="value" style="font-size:1rem; padding-top:0.4rem">{html_mod.escape(waf_str.split(',')[0] if waf_str else '—')}</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>🔬 Davranışsal WAF Analizi</h2>
+  <div class="beh-grid">
+    <div class="beh-item"><div class="k">Blok Oranı</div><div class="v">{beh_block_rate}</div></div>
+    <div class="beh-item"><div class="k">Ort. Blok Süresi</div><div class="v">{beh_block_ms}</div></div>
+    <div class="beh-item"><div class="k">Ort. Geçiş Süresi</div><div class="v">{beh_pass_ms}</div></div>
+    <div class="beh-item"><div class="k">Rate Limiting</div><div class="v">{beh_ratelimit}</div></div>
+    <div class="beh-item"><div class="k">Learning Mode</div><div class="v">{beh_learning}</div></div>
+  </div>
+  {'<ul class="notes-list">' + beh_notes_html + '</ul>' if beh_notes_html else ''}
+</div>
+
+<div class="section">
+  <h2>✅ Bypass Sonuçları ({len(bypasses)} adet)</h2>
+  {'<table><thead><tr><th>HTTP</th><th>Bytes</th><th>Conf%</th><th>Sinyaller</th><th>Payload</th><th>Nedenler</th></tr></thead><tbody>' + rows_html + '</tbody></table>' if bypasses else '<div class="no-bypass">🎉 Hiç bypass tespit edilmedi</div>'}
+</div>
+
+<div class="footer">WAFuZzor v2.0 — github.com/Pavlushkax/WAFuZzor-v2.0 — Yalnızca yetkili ortamlarda kullanın.</div>
+
+</body>
+</html>"""
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        console.print(f"[success]✔[/success] HTML rapor → {path}")
+
+    def export_html(self, path: str):
+        """Tüm sonuçları güzel bir HTML raporuna yazar."""
+        import html as html_mod
+        from datetime import datetime
+
+        bypasses = [r for r in self.results if r.bypass]
+        errors   = [r for r in self.results if r.status in [0, -1]]
+        blocked  = [r for r in self.results if not r.bypass and r.status not in [0, -1]]
+        total    = len(self.results)
+
+        waf_label = ", ".join(n for n, _ in self.waf_names[:3]) if self.waf_names else "Tespit edilemedi"
+        ts        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Behavioral probe tablosu
+        beh_html = ""
+        beh = getattr(self, "behavioral_data", None)
+        if beh and beh.get("probe_results"):
+            rows = ""
+            for probe, res in beh["probe_results"].items():
+                status_class = "blocked" if res.get("blocked") else "bypass"
+                label        = "BLOK" if res.get("blocked") else "GEÇTİ"
+                rows += f"""<tr>
+                    <td><code>{html_mod.escape(probe)}</code></td>
+                    <td><span class="badge {status_class}">{label}</span></td>
+                    <td>{res.get('status','?')}</td>
+                    <td>{res.get('time_ms','?')} ms</td>
+                </tr>"""
+            notes_html = "".join(f"<li>{html_mod.escape(n)}</li>" for n in beh.get("notes", []))
+            beh_html = f"""
+            <section>
+                <h2>🔬 Davranışsal WAF Analizi</h2>
+                <div class="stat-row">
+                    <div class="stat-box">
+                        <div class="stat-num" style="color:#f59e0b">%{int(beh['block_rate']*100)}</div>
+                        <div class="stat-label">Blok Oranı</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-num" style="color:{'#ef4444' if beh['challenge_detected'] else '#22c55e'}">
+                            {'EVET' if beh['challenge_detected'] else 'HAYIR'}
+                        </div>
+                        <div class="stat-label">JS Challenge</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-num" style="color:{'#ef4444' if beh['timing_anomaly'] else '#22c55e'}">
+                            {'EVET' if beh['timing_anomaly'] else 'HAYIR'}
+                        </div>
+                        <div class="stat-label">Timing Anomalisi</div>
+                    </div>
+                </div>
+                {'<ul class="notes">' + notes_html + '</ul>' if notes_html else ''}
+                <table>
+                    <thead><tr><th>Probe</th><th>Sonuç</th><th>HTTP</th><th>Süre</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </section>"""
+
+        # Bypass satırları
+        bypass_rows = ""
+        for r in sorted(bypasses, key=lambda x: x.confidence, reverse=True):
+            reasons_html = "<br>".join(html_mod.escape(reason) for reason in r.reasons)
+            bypass_rows += f"""<tr>
+                <td>{r.status}</td>
+                <td>{r.length}</td>
+                <td><span class="conf-bar">
+                    <span class="conf-fill" style="width:{r.confidence}%"></span>
+                    <span class="conf-text">{r.confidence}%</span>
+                </span></td>
+                <td>{html_mod.escape(r.signals)}</td>
+                <td><code class="payload">{html_mod.escape(r.payload[:120])}</code></td>
+                <td class="reasons">{reasons_html}</td>
+            </tr>"""
+
+        html_content = f"""<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WAFuZzor Raporu — {html_mod.escape(self.url)}</title>
+    <style>
+        :root {{
+            --bg: #0f1117; --surface: #1a1d27; --surface2: #242736;
+            --border: #2e3347; --text: #e2e8f0; --muted: #64748b;
+            --green: #22c55e; --red: #ef4444; --yellow: #f59e0b;
+            --blue: #38bdf8; --purple: #a78bfa;
+        }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; padding: 2rem; }}
+        h1 {{ font-size: 1.8rem; margin-bottom: 0.25rem; color: var(--blue); }}
+        h2 {{ font-size: 1.2rem; margin: 2rem 0 1rem; color: var(--purple); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }}
+        .meta {{ color: var(--muted); font-size: 0.85rem; margin-bottom: 2rem; }}
+        .meta span {{ margin-right: 1.5rem; }}
+        .stat-row {{ display: flex; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap; }}
+        .stat-box {{ background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem 2rem; text-align: center; min-width: 130px; }}
+        .stat-num {{ font-size: 2rem; font-weight: 700; }}
+        .stat-label {{ font-size: 0.78rem; color: var(--muted); margin-top: 0.3rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+        table {{ width: 100%; border-collapse: collapse; background: var(--surface); border-radius: 10px; overflow: hidden; margin-bottom: 1.5rem; }}
+        th {{ background: var(--surface2); padding: 0.75rem 1rem; text-align: left; font-size: 0.82rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }}
+        td {{ padding: 0.75rem 1rem; border-top: 1px solid var(--border); vertical-align: top; font-size: 0.88rem; }}
+        tr:hover td {{ background: var(--surface2); }}
+        code {{ font-family: 'Cascadia Code', 'Fira Mono', monospace; font-size: 0.82rem; }}
+        code.payload {{ color: var(--yellow); word-break: break-all; }}
+        .badge {{ display: inline-block; padding: 0.2rem 0.6rem; border-radius: 99px; font-size: 0.75rem; font-weight: 600; }}
+        .badge.bypass {{ background: #14532d; color: var(--green); }}
+        .badge.blocked {{ background: #450a0a; color: var(--red); }}
+        .conf-bar {{ display: flex; align-items: center; gap: 0.5rem; }}
+        .conf-fill {{ height: 8px; border-radius: 4px; background: linear-gradient(90deg, var(--green), var(--yellow)); min-width: 4px; }}
+        .conf-text {{ font-size: 0.8rem; color: var(--muted); white-space: nowrap; }}
+        .reasons {{ color: var(--muted); font-size: 0.82rem; }}
+        .notes {{ margin: 0.5rem 0 1rem 1.2rem; color: var(--muted); font-size: 0.85rem; }}
+        .notes li {{ margin-bottom: 0.3rem; }}
+        section {{ margin-bottom: 2.5rem; }}
+        .waf-badge {{ display: inline-block; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 0.3rem 0.8rem; margin-right: 0.5rem; font-size: 0.85rem; color: var(--blue); }}
+        footer {{ margin-top: 3rem; color: var(--muted); font-size: 0.78rem; border-top: 1px solid var(--border); padding-top: 1rem; }}
+    </style>
+</head>
+<body>
+    <h1>🛡️ WAFuZzor Raporu</h1>
+    <div class="meta">
+        <span>🎯 <strong>{html_mod.escape(self.url)}</strong></span>
+        <span>🕐 {ts}</span>
+        <span>🔍 WAF: {html_mod.escape(waf_label)}</span>
+    </div>
+
+    <section>
+        <h2>📊 Özet</h2>
+        <div class="stat-row">
+            <div class="stat-box">
+                <div class="stat-num" style="color:var(--blue)">{total}</div>
+                <div class="stat-label">Toplam Mutation</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-num" style="color:{'var(--red)' if bypasses else 'var(--green)'}">
+                    {len(bypasses)}
+                </div>
+                <div class="stat-label">Bypass</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-num" style="color:var(--muted)">{len(blocked)}</div>
+                <div class="stat-label">Bloklandı</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-num" style="color:var(--yellow)">{len(errors)}</div>
+                <div class="stat-label">Hata/Timeout</div>
+            </div>
+        </div>
+
+        <div>WAF Tespiti:
+        {"".join(f'<span class="waf-badge">{html_mod.escape(n)} ({c}%)</span>' for n, c in self.waf_names[:5])}
+        </div>
+    </section>
+
+    {beh_html}
+
+    <section>
+        <h2>🚨 Bypass Edilen Payload'lar ({len(bypasses)})</h2>
+        {'<p style="color:var(--green)">✔ Hiçbir payload WAF\'ı bypass edemedi.</p>' if not bypasses else f"""
+        <table>
+            <thead>
+                <tr>
+                    <th>HTTP</th><th>Bytes</th><th>Güven</th>
+                    <th>Sinyaller</th><th>Payload</th><th>Nedenler</th>
+                </tr>
+            </thead>
+            <tbody>{bypass_rows}</tbody>
+        </table>"""}
+    </section>
+
+    <footer>
+        WAFuZzor v2.0 — Red Team Edition &nbsp;|&nbsp;
+        Yalnızca yetkili ortamlarda kullanın &nbsp;|&nbsp;
+        <a href="https://github.com/Pavlushkax/WAFuZzor-v2.0" style="color:var(--blue)">GitHub</a>
+    </footer>
+</body>
+</html>"""
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        console.print(f"[success]✔[/success] HTML rapor → {path}")
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -1071,8 +1699,7 @@ BANNER = r"""[primary]
  \ \    / /  /_\ | __\ \ / / |_ _ __ __ _ _______ _ 
   \ \/\/ /  / _ \| _| \ V /| | | '_ \ _` |_ / _` | ' \
    \_/\_/  /_/ \_\_|   \_/ |_|_|_.__/\__,_/__\__,_|_||_|
-[/primary][secondary]  Red Team Edition v2.0 — Yalnızca yetkili ortamlarda kullanın.
-  GitHub: https://github.com/pavlushkax[/secondary]
+[/primary][secondary]  Red Team Edition v2.0 — Yalnızca yetkili ortamlarda kullanın.[/secondary]
 """
 
 async def main():
@@ -1134,6 +1761,12 @@ async def main():
                         help="JSON rapor çıktı dosyası")
     parser.add_argument("--output-payloads",
                         help="Başarılı bypass payload'larını .txt olarak kaydet")
+    parser.add_argument("--output-html",
+                        help="Tüm sonuçları HTML rapora yaz (ör: rapor.html)")
+    parser.add_argument("--report",
+                        help="HTML rapor çıktı dosyası (ör: report.html)")
+    parser.add_argument("--no-behavioral", action="store_true",
+                        help="Davranışsal WAF fingerprint problarını atla (daha hızlı)")
     parser.add_argument("--force", action="store_true",
                         help="Baseline başarısız olsa bile devam et (false positive riski!)")
     parser.add_argument("--benign", default="safe_string_test_123",
@@ -1172,9 +1805,6 @@ async def main():
                 line = line.strip()
                 if line and not line.startswith("#"):
                     base_payloads.append(line)
-                    if args.wordlist and not args.no_mutate:
-                        args.no_mutate = True
-                        print("[!] Wordlist modu: mutation otomatik kapatıldı.")
 
     if not base_payloads:
         console.print("[danger]Hiç payload yüklenmedi![/danger]")
@@ -1195,6 +1825,7 @@ async def main():
     baseline_ok = await fuzzer.run_baseline(
         benign_str=args.benign,
         malicious_payload=base_payloads[0],
+        behavioral=not args.no_behavioral,
     )
     if not baseline_ok and not args.force:
         console.print("[warning]Baseline başarısız. --force ile zorlamak için tekrar çalıştırın.[/warning]")
@@ -1233,6 +1864,10 @@ async def main():
         fuzzer.export_json(args.output)
     if args.output_payloads:
         fuzzer.export_txt(args.output_payloads)
+    if args.output_html:
+        fuzzer.export_html(args.output_html)
+    if args.report:
+        fuzzer.export_html(args.report)
 
 
 if __name__ == "__main__":
